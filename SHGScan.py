@@ -9,7 +9,9 @@
     # Automatically scan for widest point
     # ? C++ routine for faster width / edge measurement
     # ? Other edge detectio algorithms - horizontal slice might be more robust against decentering
-#    ? Automated sun finding? should be possible to slew back and forth to maximize the ROI mean brightness, as long as somewhat close to the sun
+    # ? Automated sun finding? should be possible to slew back and forth to maximize the ROI mean brightness, as long as somewhat close to the sun
+    # ? save start position at start of each cycle? On abort reposition here, then slew half of last cycle time to reach midpoint. If no cycles yet completed
+    #    would simply reposition to start coordinates.
 # *****************************************************************************************************
 
 import time, os, sys, math, clr, io, re
@@ -523,7 +525,7 @@ class SHGForm(Form):
         SharpCap.Mounts.SelectedMount.MoveAxis(self.AxisToMove, self.SlewFactor)
         time.sleep((endTime - startTime)/2)
         SharpCap.Mounts.SelectedMount.MoveAxis(self.AxisToMove, 0)
-        self.EnableGo()
+        self.enableGo()
         
     def RestorePos(self):
         saveRate = SharpCap.Mounts.SelectedMount.SelectedRate
