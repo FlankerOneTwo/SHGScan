@@ -38,6 +38,7 @@ When clicked, this displays a Form with a number of controls on it. The Form run
   If the "Abort" button is clicked, acquisition is terminated and the mount is repositioned to the starting position prior to _any_ scan cycles. Note that if alignment is not precise, this may not be at the midpoint of sun any more  
 
 Currently all captured sequences are stored in the default SharpCap capture folder. It may be helpful to rename this folder after each group of cycles in order to avoid confusion as to which files belong to which run. At some future point, the script may provide some means to specify a folder name stub, and automatically organize the runs into sub folders.  
+When closed, the script automatically writes its parameters to SHG.cfg, located in the %APPDATA%/SharpCap folder. These settings are reloaded when the script is next started. If no such file exists (for instance the initial run), default settings are used and written.
 
 Patrick Hsieh  
 flankeronetwo@gmail.com  
