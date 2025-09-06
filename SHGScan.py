@@ -3,15 +3,13 @@
 # (c) 2025 Patrick Hsieh
 #
 # Version: 1.0 (9/1/2025) Initial release
+#       Requires SharpCap 4.1 or higher
 #
 # To Do: 
     # Organize captures into folders
-    # Automatically scan for widest point
-    # ? C++ routine for faster width / edge measurement
-    # ? Other edge detectio algorithms - horizontal slice might be more robust against decentering
+    # Automatically scan for widest point - could probably implement searching for max average over ROI
+    # Automatic centering - rather slow to scan back and forth to find edges exactly, but could guess based on difference in mean between left and right half
     # ? Automated sun finding? should be possible to slew back and forth to maximize the ROI mean brightness, as long as somewhat close to the sun
-    # ? save start position at start of each cycle? On abort reposition here, then slew half of last cycle time to reach midpoint. If no cycles yet completed
-    #    would simply reposition to start coordinates.
 # *****************************************************************************************************
 
 import time, os, sys, math, clr, io, re
@@ -19,6 +17,9 @@ from pathlib import Path
 clr.AddReference("System.Drawing")
 clr.AddReference("System.Windows.Forms")
 clr.AddReference("System.Threading.Tasks")
+# clr.AddReference("ASCOM.Com")
+# clr.AddReference("ASCOM.Tools")
+
 from System.Threading.Tasks import Task
 import System.Drawing
 import System.Windows.Forms
@@ -27,23 +28,28 @@ from System import EventHandler
 from System.Drawing import *
 from System.Drawing.Drawing2D import InterpolationMode
 from System.Windows.Forms import *
-from SharpCap.Base import Interfaces, NotificationStatus
+from SharpCap.Base import Interfaces, NotificationStatus, RADecPosition, Epoch
+from SharpCap.UI import CaptureLimitType
 
 ############### GLOBALS #################
 MAX_BRIGHT = 65535
 DEFAULT_SUN_WIDTH = 2300        # roughly correct for 80mm f/7 refractor, ASI678MM (2u pixels)
 DEFAULT_CYCLE_SLEEP=0.5
 DEFAULT_SLEWPAD = 0.5
-DEFAULT_THRESHOLD = 0.1
+DEFAULT_THRESHOLD = 100.0       # max stddev ADU for limb crossing
 DEFAULT_CYCLES = 15
 DEFAULT_BIDIRECTIONAL = False
 DEFAULT_BUMPSWAP = False
 DEFAULT_AXISTOMOVE = 0          # RA by default
-IsAbortState = False
 MainForm = None
-globalTabIndex=0
+FIND_RATE = 64
+CENTER_RATE = 16
+REPOSITION_RATE = 32
 ### END GOBALS
 
+# not sure why localization doesn't seem to work for number formatting, convert commas to decimal point
+def reformatNum(str):
+    return str.replace(',', '.')
 
 class SHGForm(Form):
 
@@ -55,22 +61,24 @@ class SHGForm(Form):
     Bidirectional = DEFAULT_BIDIRECTIONAL
     BumpRate = 8
     BumpSwap = DEFAULT_BUMPSWAP
-    AxisToMove = DEFAULT_AXISTOMOVE      # RA by default. Dec is axis 1
+    AxisToMove = DEFAULT_AXISTOMOVE      # 0 (RA) by default. Dec is axis 1
     
     # Vars for frame handling
     EdgePassed = False
     PositiveSignal = False
-    LimbThreshold = MAX_BRIGHT * DEFAULT_THRESHOLD
+    LimbThreshold = 100
     FrameInterval = 10         # assess for transition every 10th frame
     FrameCount = FrameInterval
-    ROIX=0
-    ROIY=0
+    FrameVal = 0
     FrameHandlingDone = False
     SunWidth = 2300
     SunDecenter = 0
-
+    
+    MaxFrameBright = 0
+    NeedReverse = False
+    CenteredSun = False
+    
     # Bump slew vars
-    AmSlewing = False
     BumpSlew = 0
     FrameRate = -1
     
@@ -117,12 +125,15 @@ class SHGForm(Form):
                         elif key == "SunWidth":
                             self.SunWidth = int(value)
                         elif key == "CycleSleep":
-                            self.CycleSleep=float(value)
+                            self.CycleSleep=float(reformatNum(value))
                         elif key == "SlewPad":
-                            self.SlewPad = float(value)
+                            self.SlewPad = float(reformatNum(value))
                         elif key == "LimbThreshold":
-                            DEFAULT_THRESHOLD = float(value)
-                            self.LimbThreshold = MAX_BRIGHT * float(value)
+                            n = float(reformatNum(value))
+                            if (n >= 1):
+                                self.LimbThreshold = n          # for backward compatibility with old brightness factor settings
+                            else:
+                                self.LimbThreshold = DEFAULT_THRESHOLD
                         elif key == "Bidirectional":
                             self.Bidirectional = (value == "True")
                         elif key == "BumpSwap":
@@ -142,7 +153,7 @@ class SHGForm(Form):
     def saveSettings(self):
         appDir = os.getenv('APPDATA')
         configFn = Path(appDir + "\\SharpCap\\SHG.cfg")
-        config = f"NumCycles={self.NumCycles}\nSunWidth={self.SunWidth}\nCycleSleep={self.CycleSleep:.2f}\nSlewPad={self.SlewPad:.2f}\nLimbThreshold={DEFAULT_THRESHOLD:.2f}\nBidirectional={self.Bidirectional}\nBumpSwap={self.BumpSwap}\nBumpRate={self.BumpRate}\nAxisToMove={self.AxisToMove}"
+        config = f"NumCycles={self.NumCycles}\nSunWidth={self.SunWidth}\nCycleSleep={self.CycleSleep:.2f}\nSlewPad={self.SlewPad:.2f}\nLimbThreshold={self.LimbThreshold:.0f}\nBidirectional={self.Bidirectional}\nBumpSwap={self.BumpSwap}\nBumpRate={self.BumpRate}\nAxisToMove={self.AxisToMove}"
         try:
             with configFn.open("w") as f:
                 f.write(config)
@@ -241,7 +252,7 @@ class SHGForm(Form):
 
     def doSlewPadChange(self, sender, args):
         try:
-            n = float(self.slewPad.Text)
+            n = float(reformatNum(self.slewPad.Text))
             if (n > 0):
                 self.SlewPad = n
             else:
@@ -251,7 +262,7 @@ class SHGForm(Form):
 
     def doCycleSleepChange(self, sender, args):
         try:
-            n = float(self.cycleSleep.Text)
+            n = float(reformatNum(self.cycleSleep.Text))
             if (n > 0):
                 self.CycleSleep = n
             else:
@@ -270,6 +281,7 @@ class SHGForm(Form):
             n = int(self.sunWidth.Text)
             if (n > 100):
                 self.SunWidth = n
+                self.CalcScanParams()
             else:
                 sender.Undo()
         except:
@@ -277,7 +289,7 @@ class SHGForm(Form):
 
     def doFrameRateChange(self, sender, args):
         try:
-            n = float(self.frameRate.Text)
+            n = float(reformatNum(self.frameRate.Text))
             if (n > 0):
                 self.FrameRate = n
                 self.CalcScanParams()
@@ -299,27 +311,29 @@ class SHGForm(Form):
             pass
             
     ######################### SHGForm action handlers #########################
+    # send command to stop movement and resume tracking, wait until mount actually stops
+    def stopSlew(self):
+        SharpCap.Mounts.SelectedMount.MoveAxis(self.AxisToMove, 0)
+        while SharpCap.Mounts.SelectedMount.Slewing:
+            time.sleep(0.25)
+            
     # find the frame rate
-    # The method of accumulating frames for 1 second doesn't seem to consistently  produce accurate results, not sure if this is because it takes some
-    # time for LatestStatus to be updated or some other reason. Robin may be implementing a method to access the frame rate more directly.
-    # Retrieving it from the displayed status will fail if the frame rate is low enough that no "fps" indicator is displayed in the status
     def getCamFramerate(self):
-        # startTime = time.time()
-        # startFrame = SharpCap.SelectedCamera.LatestStatus.CapturedFrames 
-        # time.sleep(1)   # measure for 1 second
-        # endTime = time.time()
-        # endFrame = SharpCap.SelectedCamera.LatestStatus.CapturedFrames 
-        # fps = (endFrame - startFrame) / (endTime - startTime)
-        status=SharpCap.SelectedCamera.LatestStatus.NotificationText
-        fps=float(status[status.find(", ")+2:status.find(" fps")]) * 1
+        startFrame = SharpCap.SelectedCamera.GetStatus(False).CapturedFrames
+        time.sleep(1)   # measure for 1 second
+        endFrame = SharpCap.SelectedCamera.GetStatus(False).CapturedFrames 
+        fps = (endFrame - startFrame)
+        # status=SharpCap.SelectedCamera.LatestStatus.NotificationText
+        # fpsStr=status[status.find(", ")+2:status.find(" fps")]
+        # fps=float(fpsStr.replace(',', '.'))      # convert to decimal representation
         return fps
     
     # framehandler for measuring width - grabs a single frame and looks for first and last transitions, calculates center
     # SharpCap blocks until framehandler returns
     def measureSunFramehandler(self, sender, args):
         frame0 = args.Frame
-        # if mean across whole image below threshold, sun is not in frame
-        if (frame0.GetStats().Item1 < self.LimbThreshold):
+        # if stddev across whole image below threshold, sun is not in frame
+        if (frame0.GetStats().Item2 < self.LimbThreshold):
             SharpCap.ShowNotification("*** Sun is not in frame ***", NotificationStatus.Error)
             self.FrameHandlingDone = True
             return
@@ -329,8 +343,8 @@ class SHGForm(Form):
         startEdge = -1
         x = 0
         while (startEdge<0 and x<imgWidth):
-            cutout = frame0.CutROI(Rectangle(x, 0, 10, 100))
-            if (cutout.GetStats().Item1 < self.LimbThreshold):
+            cutout = frame0.CutROI(Rectangle(x, 0, 10, 10))
+            if (cutout.GetStats().Item2 < self.LimbThreshold):
                 x += 1
             else:
                 startEdge = x
@@ -339,8 +353,8 @@ class SHGForm(Form):
         endEdge = -1
         x = imgWidth
         while (endEdge<0 and x>=0):
-            cutout = frame0.CutROI(Rectangle(x, 0, 10, 100))
-            if (cutout.GetStats().Item1 < self.LimbThreshold):
+            cutout = frame0.CutROI(Rectangle(x, 0, 10, 10))
+            if (cutout.GetStats().Item2 < self.LimbThreshold):
                 x -= 1
             else:
                 endEdge = x
@@ -349,36 +363,36 @@ class SHGForm(Form):
             self.SunWidth = endEdge - startEdge
             self.SunDecenter = (self.SunWidth/2 + startEdge) - (imgWidth+10)/2
         else:
+            SharpCap.ShowNotification("*** Sun is not in frame ***", NotificationStatus.Error)
             self.SunWidth = DEFAULT_SUN_WIDTH
             self.sunDecenter = 0
         self.FrameHandlingDone = True
 
     # Framehandler to detect negative limb transition, check every FrameInterval captured frames
+    # stddev < 100 seems to work pretty well
     def acquireFramehandler(self, sender, args):
         if (self.FrameCount == 0):
             try:
-                # get stats on center 100x100
-                cutout = args.Frame.CutROI(Rectangle(self.ROIX, self.ROIY, 100, 100))
+                val = args.Frame.GetStats().Item2   # std dev
                 
                 # If still waiting positive transition, check if average is above limb threshold
                 if (not self.PositiveSignal):
-                    self.PositiveSignal = cutout.GetStats().Item1 > self.LimbThreshold
+                    self.PositiveSignal = val > self.LimbThreshold
                 # Otherwise check if average is below limb threshold
                 elif (not self.EdgePassed):
-                    self.EdgePassed = cutout.GetStats().Item1 < self.LimbThreshold
+                    self.EdgePassed = val < self.LimbThreshold
                     
                 self.FrameCount = self.FrameInterval      # reset interval counter
             except:
                 print("Problem framehandler")
         else:
                 self.FrameCount -= 1
-        self.FrameHandlingDone = True
         
     # if a bump slew was requested, do 1/4 second slew at the indicated rate. Move the axis not being used for acquisition
     def DoBumpSlew(self):
         SharpCap.Mounts.SelectedMount.MoveAxis(abs(1 - self.AxisToMove), self.BumpSlew)
         time.sleep(0.25)
-        SharpCap.Mounts.SelectedMount.MoveAxis(abs(1 - self.AxisToMove), 0)
+        self.stopSlew()
         self.BumpSlew = 0
         
     # Function to slew in Dec at the given rate until past the limb (brightness drops off below 10%), then for an additional
@@ -386,44 +400,50 @@ class SHGForm(Form):
     # error out if limb not detected within 30 seconds, and reposition to rough starting position
     # returns True if edge successfully detected, False otherwise
     def SlewPastLimb(self, rate):
-        self.AmSlewing = True
         self.EdgePassed = False
         self.PositiveSignal = False
         self.FrameCount = self.FrameInterval
         pad_rate = self.SlewFactor
         math.copysign(pad_rate, rate)   # make padded_slew in same direction
 
-        # set frame handler and start time
+        # wait until any previous slews completed
+        while SharpCap.Mounts.SelectedMount.Slewing:
+            time.sleep(0.25)
+            
+        # set frame handler and start time and position
         SharpCap.SelectedCamera.FrameCaptured += self.acquireFramehandler
-        startTime = time.time()
+        startPos = SharpCap.Mounts.SelectedMount.Coordinates
         
         SharpCap.Mounts.SelectedMount.MoveAxis(self.AxisToMove, rate)
-        print(f"Telescope moving at {rate:.2f}x solar speed...")
+        print(f"Telescope moving at {rate:.2f}x sidereal speed...")
         while (not self.EdgePassed):     # wait until past limb or 30 seconds passed
-            endTime = time.time()
+            endPos = SharpCap.Mounts.SelectedMount.Coordinates
+            if (self.AxisToMove == 0):          # slewing in RA
+                diff = abs(startPos.OffsetTo(endPos).DeltaRA)
+            else:
+                diff = abs(startPos.OffsetTo(endPos).DeltaDec)
             if (self.TaskAbortFlag):
+                self.stopSlew()
+                SharpCap.SelectedCamera.FrameCaptured -= self.acquireFramehandler
                 return False
-            elif (endTime - startTime > 30):
-                SharpCap.ShowNotification("\r*** Limb passage not detected within 30 seconds - repositioning mount ***", NotificationStatus.Error)
-                SharpCap.Mounts.SelectedMount.MoveAxis(self.AxisToMove, 0)    # Stop slew
-                SharpCap.Mounts.SelectedMount.MoveAxis(self.AxisToMove, -rate) # reverse for the same amount of time
-                time.sleep(int(endTime - startTime))
-                SharpCap.Mounts.SelectedMount.MoveAxis(self.AxisToMove, 0)    # Stop slew, resume tracking
-                break
+            elif (diff >= 1):       # we've slewed more that 1 degree, so clearly something's wrong if we haven't hit solar limb yet
+                SharpCap.ShowNotification("\r*** Limb passage not detected within 1 degree ***", NotificationStatus.Error)
+                SharpCap.SelectedCamera.FrameCaptured -= self.acquireFramehandler
+                self.stopSlew()
+                return False
         
         SharpCap.SelectedCamera.FrameCaptured -= self.acquireFramehandler   # unset frame handler
-        if (self.EdgePassed):     # if we've successfully detected the negative transition, slew an additional pad and resume tracking
-            SharpCap.Mounts.SelectedMount.MoveAxis(self.AxisToMove, pad_rate)
-            time.sleep(self.SlewPad)
-            SharpCap.Mounts.SelectedMount.MoveAxis(self.AxisToMove, 0)    # Stop slew - rate of 0 restores previous tracking rate
+        # if we've successfully detected the negative transition, slew an additional pad and resume tracking
+        SharpCap.Mounts.SelectedMount.MoveAxis(self.AxisToMove, pad_rate)
+        time.sleep(self.SlewPad)
+        self.stopSlew()
         
         # if a bump slew was requested, do it now
         if (self.BumpSlew != 0):
             self.DoBumpSlew()
-        self.AmSlewing = False
         return(self.EdgePassed)
         
-    def MeasureSun(self, sender, event):
+    def doMeasureSun(self, sender, event):
         # update frame rate
         fps = self.getCamFramerate()
         self.frameRate.Text = f"{fps:.2f}"
@@ -446,15 +466,18 @@ class SHGForm(Form):
     def enableGo(self):
        self.goButton.Enabled = True
        self.abortButton.Enabled = False
-
         
     def enableAbort(self):
        self.abortButton.Enabled = True
        self.goButton.Enabled = False
         
     # do the actual data acquisition
-    # There is no good way to interrupt this in SharpCap, should probably be implemented as an asynchronous loop
-    # although at least if displayed using ShowDialog, you can Ctrl-C the Python execution
+    # start capture, wait until capturing actually started, check every .25 sec
+    def startCapture(self):
+        SharpCap.SelectedCamera.RunCapture()
+        while not SharpCap.SelectedCamera.Capturing:
+            time.sleep(0.1)
+
     def asyncDoGo(self, sender, event):
         # enable Abort button, disable Go button
         self.enableAbort()
@@ -466,23 +489,23 @@ class SHGForm(Form):
         self.SavePos()
         
         # slew past edge to starting position
-        self.SlewPastLimb(-self.SlewFactor)
+        self.TaskAbortFlag = not self.SlewPastLimb(-self.SlewFactor)
         if (self.TaskAbortFlag):
             self.DoAbortTask()
             return
             
         # Main data acquisition loop
         self.progBar.Value = 1
-        Num_cycles = int(self.NumCycles)
-        for cycle in range(Num_cycles):
-            print(f"Cycle {cycle + 1} of {Num_cycles}")
+        for cycle in range(self.NumCycles):
+            print(f"Cycle {cycle + 1} of {self.NumCycles}")
+            self.SavePos()
             
             # Start capture
             startTime = time.time()
             SharpCap.SelectedCamera.PrepareToCapture()
-            SharpCap.SelectedCamera.RunCapture()
+            self.startCapture()
             print("Capture started...")
-            self.SlewPastLimb(self.SlewFactor)     # slew until past the limb
+            self.TaskAbortFlag = not self.SlewPastLimb(self.SlewFactor)     # slew until past the limb
             # Stop capture
             SharpCap.SelectedCamera.StopCapture()
             print("Capture stopped.")
@@ -496,9 +519,9 @@ class SHGForm(Form):
                 if (self.Bidirectional):
                     # capture in reverse direction
                     SharpCap.SelectedCamera.PrepareToCapture()
-                    SharpCap.SelectedCamera.RunCapture()
+                    self.startCapture()
                     print("Reverse capture started...")
-                    self.SlewPastLimb(-self.SlewFactor)
+                    self.TaskAbortFlag = not self.SlewPastLimb(-self.SlewFactor)
                     # Stop capture
                     SharpCap.SelectedCamera.StopCapture()
                     print("Capture stopped.")
@@ -507,7 +530,7 @@ class SHGForm(Form):
                 else:
                     # return at high speed until past limb, then for pad seconds at forward rate
                     print(f"Returning telescope at {-8*self.SlewFactor:.2f}...")
-                    self.SlewPastLimb(-8*self.SlewFactor)
+                    self.TaskAbortFlag = not self.SlewPastLimb(-8*self.SlewFactor)
                     print("done")
                     
                 # Pause between cycles with a live countdown
@@ -516,7 +539,7 @@ class SHGForm(Form):
                     return
                 else:
                     print(f"Sleep {self.CycleSleep:.2f} seconds.")
-                    time.sleep(float(self.cycleSleep.Text))
+                    time.sleep(self.CycleSleep)
             self.progBar.Increment(1)
             
         print("Completed all cycles.")
@@ -524,12 +547,12 @@ class SHGForm(Form):
         # Reposition roughly over center of sun
         SharpCap.Mounts.SelectedMount.MoveAxis(self.AxisToMove, self.SlewFactor)
         time.sleep((endTime - startTime)/2)
-        SharpCap.Mounts.SelectedMount.MoveAxis(self.AxisToMove, 0)
+        self.stopSlew()
         self.enableGo()
         
     def RestorePos(self):
         saveRate = SharpCap.Mounts.SelectedMount.SelectedRate
-        SharpCap.Mounts.SelectedMount.SelectedRate = Interfaces.AxisRate.ForSiderealRate(32)
+        SharpCap.Mounts.SelectedMount.SelectedRate = Interfaces.AxisRate.ForSiderealRate(REPOSITION_RATE)
         SharpCap.Mounts.SelectedMount.SlewTo(self.SavedCoords)
         SharpCap.Mounts.SelectedMount.SelectedRate = saveRate
     
@@ -540,12 +563,15 @@ class SHGForm(Form):
         self.TaskAbortFlag = True
 
     def DoAbortTask(self):
-        # Stop any running capture, stop mount movement, return to saved position
-        SharpCap.SelectedCamera.StopCapture()
-        SharpCap.Mounts.SelectedMount.MoveAxis(self.AxisToMove, 0)
+        # Stop any running capture, stop mount movement, return to saved position, ensure all framehandlers unset
+        if SharpCap.SelectedCamera.Capturing:
+            SharpCap.SelectedCamera.StopCapture()
+        if SharpCap.Mounts.SelectedMount.Slewing:
+            self.stopSlew()
         self.RestorePos()
-        self.AmSlewing = False
-        self.BumpSlew = -1
+        self.BumpSlew = 0
+        SharpCap.SelectedCamera.FrameCaptured -= acquireFramehandler
+        SharpCap.SelectedCamera.FrameCaptured -= measureSunFramehandler
         self.TaskAbortFlag = False
         self.enableGo()
 
@@ -556,7 +582,7 @@ class SHGForm(Form):
         self.BumpSlew = -self.BumpRate
         if (self.BumpSwap):
             self.BumpSlew *= -1
-        if (not self.AmSlewing):
+        if (not SharpCap.Mounts.SelectedMount.Slewing):
             self.DoBumpSlew()
 
     def DoBumpLFast(self, sender, event):
@@ -564,7 +590,7 @@ class SHGForm(Form):
         self.BumpSlew = -2 * self.BumpRate
         if (self.BumpSwap):
             self.BumpSlew *= -1
-        if (not self.AmSlewing):
+        if (not SharpCap.Mounts.SelectedMount.Slewing):
             self.DoBumpSlew()
         
     def DoBumpR(self, sender, event):
@@ -572,7 +598,7 @@ class SHGForm(Form):
         self.BumpSlew = self.BumpRate
         if (self.BumpSwap):
             self.BumpSlew *= -1
-        if (not self.AmSlewing):
+        if (not SharpCap.Mounts.SelectedMount.Slewing):
             self.DoBumpSlew()
         
     def DoBumpRFast(self, sender, event):
@@ -580,9 +606,9 @@ class SHGForm(Form):
         self.BumpSlew = 2 * self.BumpRate
         if (self.BumpSwap):
             self.BumpSlew *= -1
-        if (not self.AmSlewing):
+        if (not SharpCap.Mounts.SelectedMount.Slewing):
             self.DoBumpSlew()
-        
+            
     ######################### shutdown #########################
     def BeforeClosing(self, sender, event):
         self.saveSettings()
@@ -607,7 +633,7 @@ class SHGForm(Form):
         self.cycleSleep = self.addTextBox("cycleSleep", f"{self.CycleSleep:.1f}", 132, 152, 45, 20, self.doCycleSleepChange)
         self.addLabel("Bump rate", 30, 178)
         self.bumpRate = self.addComboBox("bumpRate", 132, 178, ["1x", "2x", "4x", "8x", "16x"], str(self.BumpRate)+"x", self.doBumpRateChange)
-        self.measureSun = self.addButton("Measure Sun", self.MeasureSun, 25, 204)
+        self.measureSun = self.addButton("Measure Sun", self.doMeasureSun, 25, 204)
         self.measureSun.BackColor = Color.Green
         self.sunWidth = self.addTextBox("sunWidth", str(self.SunWidth), 132, 206, 45, 20, self.doSunWidthChange)
         self.addLabel("offset", 190, 210)
@@ -644,17 +670,14 @@ class SHGForm(Form):
         if (cam.ROI.Width<100 or cam.ROI.Height<100):
             SharpCap.ShowNotification("*** Capture ROI must be at least 100x100 pixels ***", NotificationStatus.Error)
             return False
-            
-        self.ROIX = int(cam.ROI.Width/2 - 50)
-        self.ROIY = int(cam.ROI.Height/2 - 50)
 
         # theoretical required slew rate is calculated assuming need as many lines as width in pixels for 1:1 aspect ratio, and one frame per line
         #   ==> sun_deg / sun_pix = deg/line, multiply by frames (aka lines) per second to obtain required deg/sec
         #   then divide by solar tracking rate of 1/240 deg/sec, which should theoretically result in 120*fps / sunPixWidth
-        self.SlewFactor = -(self.FrameRate * 120) / int(self.sunWidth.Text)
-        if (self.SlewFactor == 0):
-            SharpCap.ShowNotification("*** Frame rate too slow! FPS indicator must be displayed ***", NotificationStatus.Error)
-            return False
+        self.SlewFactor = -(self.FrameRate * 120) / self.SunWidth
+        # if (self.SlewFactor == 0):
+            # SharpCap.ShowNotification("*** Frame rate too slow! FPS indicator must be displayed ***", NotificationStatus.Error)
+            # return False
         cycle_duration = self.SlewPad * 2 + (self.SunWidth/self.FrameRate)
         self.FPSInfo.Text = f"{self.FrameRate:.2f} fps => {abs(self.SlewFactor):.2f}x solar => est cycle duration: {cycle_duration:.2f} sec"
         return True
@@ -673,9 +696,11 @@ def launch_SHGForm():
     if (not SharpCap.Mounts.SelectedMount.IsConnected):
         SharpCap.Mounts.SelectedMount.Connected = True
             
-    # set capture mode to MONO16, SER capture, mount to solar tracking rate
+    # set capture mode to MONO16, SER capture, no limit, mount to solar tracking rate
     SharpCap.SelectedCamera.Controls.ColourSpace.Value = "MONO16"
     SharpCap.SelectedCamera.Controls.OutputFormat.Value = "SER file (*.ser)"
+    SharpCap.SelectedCamera.CaptureConfig.CaptureLimitType = CaptureLimitType.Unlimited
+    
     SharpCap.SelectedCamera.LiveView = True
     SharpCap.Mounts.SelectedMount.TrackingRate = Interfaces.TrackingRate.Solar
 
@@ -686,7 +711,6 @@ def launch_SHGForm():
 
     fps=MainForm.getCamFramerate()
     MainForm.frameRate.Text = f"{fps:.2f}"
-    MainForm.doFrameRateChange(None, None)
 
     if (MainForm.CalcScanParams()):
         Task.Factory.StartNew(MainForm.ShowDialog)
