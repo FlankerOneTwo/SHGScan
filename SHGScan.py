@@ -276,7 +276,7 @@ class SHGForm(Form):
             self.recFrameRate.Text = "N/A"
         
     def doFixedSlewRateChange(self, sender, args):
-        self.FixedSlewRate = int(self.fixedSlewRate.SelectedItem.strip(" x"))
+        self.FixedSlewRate = int(self.fixedSlewRate.SelectedItem.strip("x"))
         self.recFrameRate.Text = str(int(self.CalcFrameRate(self.FixedSlewRate)))
 
     def doSlewPadChange(self, sender, args):
@@ -311,6 +311,7 @@ class SHGForm(Form):
             if (n > 100):
                 self.SunWidth = n
                 self.CalcScanParams()
+                self.doFixedSlewRateChange(sender, args)
             else:
                 sender.Undo()
         except:
@@ -801,7 +802,7 @@ class SHGForm(Form):
         self.bumpRate = self.addComboBox("bumpRate", 132, 204, ["1x", "2x", "4x", "8x", "16x"], str(self.BumpRate)+"x", self.doBumpRateChange)
         self.measureSun = self.addButton("Measure Sun", self.doMeasureSun, 25, 230)
         self.measureSun.BackColor = Color.Green
-        self.sunWidth = self.addTextBox("sunWidth", str(self.SunWidth), 132, 231    , 45, 20, self.doSunWidthChange)
+        self.sunWidth = self.addTextBox("sunWidth", str(self.SunWidth), 132, 231, 45, 20, self.doSunWidthChange)
         self.addLabel("offset", 190, 233    )
         self.decenter = self.addTextBox("decenter", "", 232, 232, 45, 20, None)
         self.decenter.ReadOnly = True
@@ -892,7 +893,6 @@ def launch_SHGForm():
         MainForm.Activate()
     else:
         MainForm.Close()
-    MainForm = None
     return MainForm
 
 ### Main script
