@@ -40,6 +40,7 @@ DEFAULT_THRESHOLD = 100.0       # max stddev ADU for limb crossing
 DEFAULT_CYCLES = 15
 DEFAULT_BIDIRECTIONAL = False
 DEFAULT_BUMPSWAP = False
+DEFAULT_FIXEDSLEW = 16
 DEFAULT_AXISTOMOVE = 0          # RA by default
 MainForm = None
 FIND_RATE = 64
@@ -78,6 +79,10 @@ class SHGForm(Form):
     NeedReverse = False
     CenteredSun = False
     
+    # Fixed slew rate vars, for mounts that don't support arbritrary slew rates
+    IsFixedSlewRate = False
+    FixedSlewRate = DEFAULT_FIXEDSLEW
+    
     # Bump slew vars
     BumpSlew = 0
     FrameRate = -1
@@ -100,7 +105,7 @@ class SHGForm(Form):
 
     def InitializeComponent(self):
         self.Text = "Spectroheliograph Auto Scan"
-        self.ClientSize = System.Drawing.Size(340, 364)
+        self.ClientSize = System.Drawing.Size(340, 390)
         self.TopMost = True
 
     # read settings from file
@@ -125,15 +130,15 @@ class SHGForm(Form):
                         elif key == "SunWidth":
                             self.SunWidth = int(value)
                         elif key == "CycleSleep":
-                            self.CycleSleep=float(reformatNum(value))
+                            self.CycleSleep=float(value)
                         elif key == "SlewPad":
-                            self.SlewPad = float(reformatNum(value))
+                            self.SlewPad = float(value)
                         elif key == "LimbThreshold":
-                            n = float(reformatNum(value))
+                            n = float(value)
                             if (n >= 1):
-                                self.LimbThreshold = n          # for backward compatibility with old brightness factor settings
+                                self.LimbThreshold = n
                             else:
-                                self.LimbThreshold = DEFAULT_THRESHOLD
+                                self.LimbThreshold = DEFAULT_THRESHOLD          # for backward compatibility with old brightness factor settings
                         elif key == "Bidirectional":
                             self.Bidirectional = (value == "True")
                         elif key == "BumpSwap":
@@ -142,6 +147,11 @@ class SHGForm(Form):
                             self.BumpRate = int(value)
                         elif key == "AxisToMove":
                             self.AxisToMove = int(value)
+                        elif key == "IsFixedSlewRate":
+                            print(f"setting is fixed to {value}")
+                            self.IsFixedSlewRate = (value == "True")
+                        elif key == "FixedSlewRate":
+                            self.FixedSlewRate = int(value)
                     f.close()
             except:
                 SharpCap.ShowNotification("Error reading settings file", NotificationStatus.Error)
@@ -153,7 +163,7 @@ class SHGForm(Form):
     def saveSettings(self):
         appDir = os.getenv('APPDATA')
         configFn = Path(appDir + "\\SharpCap\\SHG.cfg")
-        config = f"NumCycles={self.NumCycles}\nSunWidth={self.SunWidth}\nCycleSleep={self.CycleSleep:.2f}\nSlewPad={self.SlewPad:.2f}\nLimbThreshold={self.LimbThreshold:.0f}\nBidirectional={self.Bidirectional}\nBumpSwap={self.BumpSwap}\nBumpRate={self.BumpRate}\nAxisToMove={self.AxisToMove}"
+        config = f"NumCycles={self.NumCycles}\nSunWidth={self.SunWidth}\nCycleSleep={self.CycleSleep:.2f}\nSlewPad={self.SlewPad:.2f}\nLimbThreshold={self.LimbThreshold:.0f}\nBidirectional={self.Bidirectional}\nBumpSwap={self.BumpSwap}\nBumpRate={self.BumpRate}\nAxisToMove={self.AxisToMove}\nIsFixedSlewRate={self.IsFixedSlewRate}\nFixedSlewRate={self.FixedSlewRate}"
         try:
             with configFn.open("w") as f:
                 f.write(config)
@@ -249,10 +259,28 @@ class SHGForm(Form):
 
     def doBidirectionalChange(self, sender, args):
         self.Bidirectional = self.bidirectional.Checked
+        
+    def CalcFrameRate(self, rate):
+        return rate * self.SunWidth / 120
+        
+    def doIsFixedSlewRateChange(self, sender, args):
+        self.IsFixedSlewRate = self.isFixedSlewRate.Checked
+        # if selected, enable fixed rate selection dropdown and calculate correct frame rate
+        if self.IsFixedSlewRate:
+            self.fixedSlewRate.Enabled = True
+            self.recFrameRate.Text = str(int(self.CalcFrameRate(self.FixedSlewRate)))
+        # otherwise disable
+        else:
+            self.fixedSlewRate.Enabled = False
+            self.recFrameRate.Text = "N/A"
+        
+    def doFixedSlewRateChange(self, sender, args):
+        self.FixedSlewRate = int(self.fixedSlewRate.SelectedItem.strip(" x"))
+        self.recFrameRate.Text = str(int(self.CalcFrameRate(self.FixedSlewRate)))
 
     def doSlewPadChange(self, sender, args):
         try:
-            n = float(reformatNum(self.slewPad.Text))
+            n = float(self.slewPad.Text)
             if (n > 0):
                 self.SlewPad = n
             else:
@@ -262,7 +290,7 @@ class SHGForm(Form):
 
     def doCycleSleepChange(self, sender, args):
         try:
-            n = float(reformatNum(self.cycleSleep.Text))
+            n = float(self.cycleSleep.Text)
             if (n > 0):
                 self.CycleSleep = n
             else:
@@ -289,7 +317,7 @@ class SHGForm(Form):
 
     def doFrameRateChange(self, sender, args):
         try:
-            n = float(reformatNum(self.frameRate.Text))
+            n = float(self.frameRate.Text)
             if (n > 0):
                 self.FrameRate = n
                 self.CalcScanParams()
@@ -609,6 +637,130 @@ class SHGForm(Form):
         if (not SharpCap.Mounts.SelectedMount.Slewing):
             self.DoBumpSlew()
             
+    # find the sun by slewing back and forth to maximize the average brightness over the frame - doesn't require specific ROI to be set
+    # if frame brightness increasing, save pos and and brightness, continue in this direction
+    # if frame brightness starts decreasing, if NeedReverse then we have passed max, otherwise set NeedReverse
+    # delta threshold of 20
+    def sunFindFramehandler(self, sender, args):
+        val = args.Frame.GetStats().Item1  # mean of entire image
+        # Average 10 frames
+        if self.FrameCount < self.FrameInterval:
+            self.FrameVal += val
+            self.FrameCount += 1
+            return
+        else:
+            val = self.FrameVal / self.FrameInterval
+            self.FrameCount = 0
+        print(f"val {val}, max {self.MaxFrameBright}")
+        if self.MaxFrameBright == 0:        # first image
+            self.MaxFrameBright = val
+            self.SavePos()
+        elif val < self.MaxFrameBright:     # either passed max, or initially down trending
+            if self.NeedReverse:            # passed the max
+                self.CenteredSun = True
+            else:
+                self.NeedReverse = True
+                print("reverse")
+        else:       # still increasing, continue slew
+            self.MaxFrameBright = val
+            self.SavePos()
+        
+    def FindSun(self):
+
+        self.MaxFrameBright = 0
+        self.FrameVal = 0
+        self.FrameCount = 0
+        self.CenteredSun = False
+        self.NeedReverse = False
+        
+        SharpCap.SelectedCamera.FrameCaptured += self.sunFindFramehandler
+        
+        # start with RA, slew until maximum found
+        print("scanning RA")
+        SharpCap.Mounts.SelectedMount.MoveAxis(0, FIND_RATE)            # scan at 8x
+        while not self.CenteredSun:
+            if self.NeedReverse:
+                SharpCap.Mounts.SelectedMount.MoveAxis(0, -FIND_RATE)
+        self.stopSlew()
+        saveRA = self.SavedCoords.RightAscension
+        
+        print(f"maximum at {self.MaxFrameBright} RA={saveRA:.2f} found")
+        
+        # now for Dec
+        print("scanning Dec")
+        self.MaxFrameBright = 0
+        self.CenteredSun = False
+        self.NeedReverse = False
+        SharpCap.Mounts.SelectedMount.MoveAxis(1, FIND_RATE)
+        while not self.CenteredSun:
+            if self.NeedReverse:
+                SharpCap.Mounts.SelectedMount.MoveAxis(1, -FIND_RATE)
+        self.stopSlew()
+        saveDec = self.SavedCoords.Declination
+        print(f"maximum at {self.MaxFrameBright} Dec={saveDec:.2f} found")
+
+        SharpCap.SelectedCamera.FrameCaptured -= self.sunFindFramehandler
+        
+        # move to correct position
+        saveRate = SharpCap.Mounts.SelectedMount.SelectedRate
+        SharpCap.Mounts.SelectedMount.SelectedRate = Interfaces.AxisRate.ForSiderealRate(REPOSITION_RATE)
+        SharpCap.Mounts.SelectedMount.SlewTo(RADecPosition(saveRA, saveDec, Epoch.J2000))
+        SharpCap.Mounts.SelectedMount.SelectedRate = saveRate
+        while SharpCap.Mounts.SelectedMount.Slewing:
+           time.sleep(0.25)
+
+    # center the sun by slewing until the average brightness in the left and right halves are equal
+    # if left brighter than right, compare to last delta. If smaller (closer to equal), continue in this direction
+    # otherwise set reverse
+    def sunCenterFramehandler(self, sender, args):
+        ROIX = int(SharpCap.SelectedCamera.ROI.Width/2)
+        ROIY = int(SharpCap.SelectedCamera.ROI.Height/2)
+        cutout1 = args.Frame.CutROI(Rectangle(0, 0, ROIX, ROIY))
+        cutout2 = args.Frame.CutROI(Rectangle(ROIX, ROIY, ROIX, ROIY))
+        diff = cutout1.GetStats().Item1  - cutout2.GetStats().Item1  # difference between left and right halves
+        if self.MaxFrameBright == 0:        # first comparison
+            self.MaxFrameBright = diff
+            self.SavePos()
+        elif diff > self.MaxFrameBright+10:     # more of a difference, either passed center, or initially down trending
+            if self.NeedReverse:             # passed center
+                self.CenteredSun = True
+            else:
+                self.NeedReverse = True
+        else:       # more equal, continue slew
+            self.MaxFrameBright = diff
+            self.SavePos()
+        
+    def CenterSun(self):
+        self.MaxFrameBright = 0
+        self.CenteredSun = False
+        self.NeedReverse = False
+        
+        SharpCap.SelectedCamera.FrameCaptured += self.sunCenterFramehandler
+        saveRA = SharpCap.Mounts.SelectedMount.Coordinates.RightAscension
+        
+        # slew in bump axis only
+        print("Centering")
+        self.MaxFrameBright = 0
+        self.CenteredSun = False
+        self.NeedReverse = False
+        SharpCap.Mounts.SelectedMount.MoveAxis(abs(1 - self.AxisToMove), CENTER_RATE)        # center at 16x
+        while not self.CenteredSun:
+            if self.NeedReverse:
+                SharpCap.Mounts.SelectedMount.MoveAxis(abs(1 - self.AxisToMove), -CENTER_RATE)
+        self.stopSlew()
+        saveDec = self.SavedCoords.Declination
+        print(f"centered at {self.MaxFrameBright} Dec={saveDec:.2f} found")
+
+        SharpCap.SelectedCamera.FrameCaptured -= self.sunCenterFramehandler
+        # move to correct position
+        saveRate = SharpCap.Mounts.SelectedMount.SelectedRate
+        SharpCap.Mounts.SelectedMount.SelectedRate = Interfaces.AxisRate.ForSiderealRate(REPOSITION_RATE)
+        SharpCap.Mounts.SelectedMount.SlewTo(RADecPosition(saveRA, saveDec, Epoch.J2000))
+        SharpCap.Mounts.SelectedMount.SelectedRate = saveRate
+        while SharpCap.Mounts.SelectedMount.Slewing:
+           time.sleep(0.25)
+
+        
     ######################### shutdown #########################
     def BeforeClosing(self, sender, event):
         self.saveSettings()
@@ -627,41 +779,54 @@ class SHGForm(Form):
         self.addLabel("Number of cycles", 30, 106)
         self.numCycles = self.addTextBox("numCycles", f"{self.NumCycles}", 132, 104 , 45, 20, self.doNumCyclesChange)
         self.bidirectional = self.addCheckbox("Bidirectional", 190, 106, self.Bidirectional, self.doBidirectionalChange)
-        self.addLabel("Slew pad (sec)", 30, 130)
-        self.slewPad = self.addTextBox("slewPad", f"{self.SlewPad:.1f}", 132, 128, 45, 20, self.doSlewPadChange)
-        self.addLabel("Cycle sleep (sec)", 30, 154)
-        self.cycleSleep = self.addTextBox("cycleSleep", f"{self.CycleSleep:.1f}", 132, 152, 45, 20, self.doCycleSleepChange)
-        self.addLabel("Bump rate", 30, 178)
-        self.bumpRate = self.addComboBox("bumpRate", 132, 178, ["1x", "2x", "4x", "8x", "16x"], str(self.BumpRate)+"x", self.doBumpRateChange)
-        self.measureSun = self.addButton("Measure Sun", self.doMeasureSun, 25, 204)
+
+        # option for fixed slew rates, disabled by default
+        self.isFixedSlewRate = self.addCheckbox("Fixed SlewRate", 30, 129, self.IsFixedSlewRate, self.doIsFixedSlewRateChange)
+        self.fixedSlewRate = self.addComboBox("", 132, 128, ["4x", "8x", "16x", "32x"], str(self.FixedSlewRate) + "x", self.doFixedSlewRateChange)
+        self.fixedSlewRate.Enabled = self.IsFixedSlewRate
+        self.recFrameRate = self. addTextBox("", str(int(self.CalcFrameRate(self.FixedSlewRate))), 196, 128, 45, 20, None)
+        self.recFrameRate.ReadOnly = True
+        self.recFrameRate.Enabled = False
+        self.recFrameRate.BorderStyle = BorderStyle.FixedSingle
+        self.addLabel("fps", 242, 128)
+        
+        self.addLabel("Slew pad (sec)", 30, 156)
+        self.slewPad = self.addTextBox("slewPad", f"{self.SlewPad:.1f}", 132, 154, 45, 20, self.doSlewPadChange)
+        self.addLabel("Cycle sleep (sec)", 30, 181)
+        self.cycleSleep = self.addTextBox("cycleSleep", f"{self.CycleSleep:.1f}", 132, 177, 45, 20, self.doCycleSleepChange)
+        self.addLabel("Bump rate", 30, 204)
+        self.bumpRate = self.addComboBox("bumpRate", 132, 204, ["1x", "2x", "4x", "8x", "16x"], str(self.BumpRate)+"x", self.doBumpRateChange)
+        self.measureSun = self.addButton("Measure Sun", self.doMeasureSun, 25, 230)
         self.measureSun.BackColor = Color.Green
-        self.sunWidth = self.addTextBox("sunWidth", str(self.SunWidth), 132, 206, 45, 20, self.doSunWidthChange)
-        self.addLabel("offset", 190, 210)
-        self.decenter = self.addTextBox("decenter", "", 230 , 206, 45, 20, None)
+        self.sunWidth = self.addTextBox("sunWidth", str(self.SunWidth), 132, 231    , 45, 20, self.doSunWidthChange)
+        self.addLabel("offset", 190, 233    )
+        self.decenter = self.addTextBox("decenter", "", 232, 232, 45, 20, None)
         self.decenter.ReadOnly = True
-        self.addLabel("Frame rate", 30, 232)
-        self.frameRate = self.addTextBox("Frame rate", "", 132, 230, 45, 20, self.doFrameRateChange)
+        self.decenter.Enabled = False
+        self.decenter.BorderStyle = BorderStyle.FixedSingle
+        self.addLabel("Frame rate", 30, 258)
+        self.frameRate = self.addTextBox("Frame rate", "", 132, 256, 45, 20, self.doFrameRateChange)
         
         # control buttons
-        self.goButton = self.addButton("Go", self.asyncDoGo, 26, 262)
+        self.goButton = self.addButton("Go", self.asyncDoGo, 26, 288)
         self.goButton.BackColor = Color.Green
         self.goButton.Size = Size(124, 28)
-        self.abortButton = self.addButton("Abort", self.DoAbort, 196, 262)
+        self.abortButton = self.addButton("Abort", self.DoAbort, 196, 288)
         self.abortButton.BackColor = Color.Red
         self.abortButton.Size = Size(124, 28)
         
         # progress bar
-        self.progBar = self.addProgressBar("", 29, 294, 288, 10, self.NumCycles)
+        self.progBar = self.addProgressBar("", 29, 320, 288, 10, self.NumCycles)
         
-        self.addLabel("swap", 156, 342)
-        self.bumpSwap = self.addCheckbox("", 166, 326, self.BumpSwap, self.doBumpSwapChange)
-        self.bumpLeft = self.addButton("<-", self.DoBumpL, 68, 324)
+        self.addLabel("swap", 156, 368)
+        self.bumpSwap = self.addCheckbox("", 166, 352, self.BumpSwap, self.doBumpSwapChange)
+        self.bumpLeft = self.addButton("<-", self.DoBumpL, 68, 350)
         self.bumpLeft.Size = Size(78, 20)
-        self.bumpLeftFast = self.addButton("<<", self.DoBumpLFast, 30, 324)
+        self.bumpLeftFast = self.addButton("<<", self.DoBumpLFast, 30, 350)
         self.bumpLeftFast.Size = Size(30, 20)
-        self.bumpRight = self.addButton("->", self.DoBumpR, 200, 324)
+        self.bumpRight = self.addButton("->", self.DoBumpR, 200, 350)
         self.bumpRight.Size = Size(78, 20)
-        self.bumpRightFast = self.addButton(">>", self.DoBumpRFast, 288, 324)
+        self.bumpRightFast = self.addButton(">>", self.DoBumpRFast, 288, 350)
         self.bumpRightFast.Size = Size(30, 20)
 
     def CalcScanParams(self):
@@ -675,9 +840,6 @@ class SHGForm(Form):
         #   ==> sun_deg / sun_pix = deg/line, multiply by frames (aka lines) per second to obtain required deg/sec
         #   then divide by solar tracking rate of 1/240 deg/sec, which should theoretically result in 120*fps / sunPixWidth
         self.SlewFactor = -(self.FrameRate * 120) / self.SunWidth
-        # if (self.SlewFactor == 0):
-            # SharpCap.ShowNotification("*** Frame rate too slow! FPS indicator must be displayed ***", NotificationStatus.Error)
-            # return False
         cycle_duration = self.SlewPad * 2 + (self.SunWidth/self.FrameRate)
         self.FPSInfo.Text = f"{self.FrameRate:.2f} fps => {abs(self.SlewFactor):.2f}x solar => est cycle duration: {cycle_duration:.2f} sec"
         return True
@@ -697,7 +859,11 @@ def launch_SHGForm():
         SharpCap.Mounts.SelectedMount.Connected = True
             
     # set capture mode to MONO16, SER capture, no limit, mount to solar tracking rate
+    if (not "MONO16" in SharpCap.SelectedCamera.Controls.ColourSpace.AvailableValues):
+        SharpCap.ShowNotification("This script requires MONO16 capture mode", NotificationStatus.Error)
+        return None
     SharpCap.SelectedCamera.Controls.ColourSpace.Value = "MONO16"
+        
     SharpCap.SelectedCamera.Controls.OutputFormat.Value = "SER file (*.ser)"
     SharpCap.SelectedCamera.CaptureConfig.CaptureLimitType = CaptureLimitType.Unlimited
     
