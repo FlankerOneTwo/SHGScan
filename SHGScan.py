@@ -100,11 +100,13 @@ class SHGForm(Form):
         self.setupForm()
         self.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Dpi
         self.AutoScaleDimensions = SizeF(96, 96)
+        self.FormBorderStyle = FormBorderStyle.Fixed3D
         self.ResumeLayout()
         self.enableGo()
 
     def InitializeComponent(self):
         self.Text = "Spectroheliograph Auto Scan"
+        self.Name = "SHG Scan"
         self.ClientSize = System.Drawing.Size(340, 390)
         self.TopMost = True
 
@@ -148,7 +150,6 @@ class SHGForm(Form):
                         elif key == "AxisToMove":
                             self.AxisToMove = int(value)
                         elif key == "IsFixedSlewRate":
-                            print(f"setting is fixed to {value}")
                             self.IsFixedSlewRate = (value == "True")
                         elif key == "FixedSlewRate":
                             self.FixedSlewRate = int(value)
@@ -351,9 +352,6 @@ class SHGForm(Form):
         time.sleep(1)   # measure for 1 second
         endFrame = SharpCap.SelectedCamera.GetStatus(False).CapturedFrames 
         fps = (endFrame - startFrame)
-        # status=SharpCap.SelectedCamera.LatestStatus.NotificationText
-        # fpsStr=status[status.find(", ")+2:status.find(" fps")]
-        # fps=float(fpsStr.replace(',', '.'))      # convert to decimal representation
         return fps
     
     # framehandler for measuring width - grabs a single frame and looks for first and last transitions, calculates center
@@ -516,8 +514,13 @@ class SHGForm(Form):
         # save start coordinates
         self.SavePos()
         
+        if self.IsFixedSlewRate:
+            slewRate = self.FixedSlewRate
+        else:
+            slewRate = self.SlewFactor
+            
         # slew past edge to starting position
-        self.TaskAbortFlag = not self.SlewPastLimb(-self.SlewFactor)
+        self.TaskAbortFlag = not self.SlewPastLimb(-slewRate)
         if (self.TaskAbortFlag):
             self.DoAbortTask()
             return
@@ -533,7 +536,7 @@ class SHGForm(Form):
             SharpCap.SelectedCamera.PrepareToCapture()
             self.startCapture()
             print("Capture started...")
-            self.TaskAbortFlag = not self.SlewPastLimb(self.SlewFactor)     # slew until past the limb
+            self.TaskAbortFlag = not self.SlewPastLimb(slewRate)     # slew until past the limb
             # Stop capture
             SharpCap.SelectedCamera.StopCapture()
             print("Capture stopped.")
@@ -549,7 +552,7 @@ class SHGForm(Form):
                     SharpCap.SelectedCamera.PrepareToCapture()
                     self.startCapture()
                     print("Reverse capture started...")
-                    self.TaskAbortFlag = not self.SlewPastLimb(-self.SlewFactor)
+                    self.TaskAbortFlag = not self.SlewPastLimb(-slewRate)
                     # Stop capture
                     SharpCap.SelectedCamera.StopCapture()
                     print("Capture stopped.")
@@ -557,8 +560,8 @@ class SHGForm(Form):
                 # Otherwise, return at high speed
                 else:
                     # return at high speed until past limb, then for pad seconds at forward rate
-                    print(f"Returning telescope at {-8*self.SlewFactor:.2f}...")
-                    self.TaskAbortFlag = not self.SlewPastLimb(-8*self.SlewFactor)
+                    print(f"Returning telescope at {-8*slewRate:.2f}...")
+                    self.TaskAbortFlag = not self.SlewPastLimb(-8*slewRate)
                     print("done")
                     
                 # Pause between cycles with a live countdown
@@ -572,8 +575,8 @@ class SHGForm(Form):
             
         print("Completed all cycles.")
             
+        SharpCap.Mounts.SelectedMount.MoveAxis(self.AxisToMove, slewRate)
         # Reposition roughly over center of sun
-        SharpCap.Mounts.SelectedMount.MoveAxis(self.AxisToMove, self.SlewFactor)
         time.sleep((endTime - startTime)/2)
         self.stopSlew()
         self.enableGo()
@@ -598,8 +601,8 @@ class SHGForm(Form):
             self.stopSlew()
         self.RestorePos()
         self.BumpSlew = 0
-        SharpCap.SelectedCamera.FrameCaptured -= acquireFramehandler
-        SharpCap.SelectedCamera.FrameCaptured -= measureSunFramehandler
+        SharpCap.SelectedCamera.FrameCaptured -= self.acquireFramehandler
+        SharpCap.SelectedCamera.FrameCaptured -= self.measureSunFramehandler
         self.TaskAbortFlag = False
         self.enableGo()
 
@@ -778,7 +781,7 @@ class SHGForm(Form):
         self.axisToMove = self.addCheckbox("Slew RA", 30, 82, self.AxisToMove==DEFAULT_AXISTOMOVE, self.doAxisToMoveChange)
         self.addLabel("Number of cycles", 30, 106)
         self.numCycles = self.addTextBox("numCycles", f"{self.NumCycles}", 132, 104 , 45, 20, self.doNumCyclesChange)
-        self.bidirectional = self.addCheckbox("Bidirectional", 190, 106, self.Bidirectional, self.doBidirectionalChange)
+        self.bidirectional = self.addCheckbox("Bidirectional", 190, 105, self.Bidirectional, self.doBidirectionalChange)
 
         # option for fixed slew rates, disabled by default
         self.isFixedSlewRate = self.addCheckbox("Fixed SlewRate", 30, 129, self.IsFixedSlewRate, self.doIsFixedSlewRateChange)
@@ -849,10 +852,15 @@ def launch_SHGForm():
     # startup tasks
     global MainForm
     
+    # only one instance at a time
+    for form in Application.OpenForms:
+        if form.Name == "SHG Scan":
+            return
+        
     # bomb if camera not connected
     if not SharpCap.SelectedCamera:
         SharpCap.ShowNotification("*** Please connect camera before starting SHG scan ***", NotificationStatus.Error)
-        return
+        return None
         
     # connect mount if not already done
     if (not SharpCap.Mounts.SelectedMount.IsConnected):
@@ -863,7 +871,6 @@ def launch_SHGForm():
         SharpCap.ShowNotification("This script requires MONO16 capture mode", NotificationStatus.Error)
         return None
     SharpCap.SelectedCamera.Controls.ColourSpace.Value = "MONO16"
-        
     SharpCap.SelectedCamera.Controls.OutputFormat.Value = "SER file (*.ser)"
     SharpCap.SelectedCamera.CaptureConfig.CaptureLimitType = CaptureLimitType.Unlimited
     
@@ -877,6 +884,7 @@ def launch_SHGForm():
 
     fps=MainForm.getCamFramerate()
     MainForm.frameRate.Text = f"{fps:.2f}"
+    MainForm.FrameRate = fps        # event loop not yet running
 
     if (MainForm.CalcScanParams()):
         Task.Factory.StartNew(MainForm.ShowDialog)
@@ -884,6 +892,7 @@ def launch_SHGForm():
         MainForm.Activate()
     else:
         MainForm.Close()
+    MainForm = None
     return MainForm
 
 ### Main script
